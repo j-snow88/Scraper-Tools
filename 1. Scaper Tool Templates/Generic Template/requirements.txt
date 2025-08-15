@@ -1,0 +1,11 @@
+# Core
+pandas==2.2.2
+openpyxl==3.1.2
+
+# Dynamic sites (JS) — Selenium + Chrome
+selenium==4.21.0
+
+# Static sites (no JS) — requests + BeautifulSoup
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.2.2

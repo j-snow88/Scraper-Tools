@@ -1,0 +1,612 @@
+Here’s a battle-tested, copy-pasteable “General Scrape Tool Template” you can save and reuse for future projects — plus a step-by-step, universal walkthrough on how to adapt it in VS Code, set up your environment, and run it safely.
+
+1) Files to create (copy/paste)
+
+Create a new folder (e.g., generic_scraper) and add these two files.
+
+requirements.txt
+# Core
+pandas==2.2.2
+openpyxl==3.1.2
+
+# Dynamic sites (JS) — Selenium + Chrome
+selenium==4.21.0
+
+# Static sites (no JS) — requests + BeautifulSoup
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.2.2
+
+scraper_template.py
+#!/usr/bin/env python3
+"""
+GENERAL SCRAPE TOOL TEMPLATE
+- Supports BOTH static (requests/BeautifulSoup) and dynamic (Selenium/Chrome) scraping
+- Pluggable pagination (numeric ?page=N or clicking "Next")
+- Pluggable link collection patterns
+- Pluggable field extraction for detail pages
+- Exports to Excel
+
+HOW TO USE (high level):
+1) Fill out the CONFIG section for your target site (START_URL, selectors, etc.).
+2) Choose engine: --engine selenium (dynamic) or --engine requests (static).
+3) Choose pagination mode: --pager numeric|next|none (or implement your own).
+4) Test a small run with --limit 5, then do the full run.
+"""
+
+import re
+import sys
+import time
+import argparse
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any, Callable
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
+
+import pandas as pd
+
+# --- Static engine imports
+import requests
+from bs4 import BeautifulSoup
+
+# --- Dynamic engine imports (optional at runtime)
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+# ========== CONFIG (EDIT THIS FOR YOUR TARGET SITE) ==========
+
+CONFIG: Dict[str, Any] = {
+    # Entry point for listing page
+    "START_URL": "https://example.com/listings",
+
+    # Pagination
+    # "numeric": build ?page=N URLs (0-index is common; set NUMERIC_PAGE_START accordingly)
+    # "next": click or select "Next" elements (Selenium only)
+    # "none": single-page listing (no pagination)
+    "PAGER_MODE": "numeric",  # numeric|next|none
+    "NUMERIC_PAGE_PARAM": "page",   # e.g., "page"
+    "NUMERIC_PAGE_START": 0,        # starting page index for numeric pager
+    "MAX_PAGES": 200,               # safety cap
+
+    # Listing page readiness (Selenium only): CSS selectors that indicate the page is "ready"
+    "LISTING_READY_SELECTORS": [".results", ".items", ".view-content"],
+
+    # Link collection patterns (CSS selectors)
+    # Provide selectors that match anchor tags pointing to detail pages
+    "LIST_LINK_SELECTORS": [
+        "a.item-link",
+        "a[href*='/detail/']",
+    ],
+
+    # When listing links are relative, join with this base (defaults to START_URL origin)
+    "FORCE_ABSOLUTE_LINKS": True,
+
+    # Detail page extraction (CSS or XPATH via Selenium; text search via BeautifulSoup when using requests)
+    # Each entry is: field_name -> extractor settings
+    # Supported extractor "types":
+    #   - "css_text": CSS selector -> text
+    #   - "css_attr": CSS selector -> attribute (attr name required)
+    #   - "regex_text": regex over full page text
+    # You can mix and match; first non-empty wins
+    "DETAIL_FIELDS": {
+        "Title": [
+            {"type": "css_text", "value": "h1"},
+            {"type": "css_text", "value": ".title"},
+        ],
+        "Address": [
+            {"type": "css_text", "value": ".address"},
+            {"type": "regex_text", "value": r"\d{2,5}\s+\w+.*?\b[A-Z]{2}\b\s*\d{5}(?:-\d{4})?"},
+        ],
+        "Phone": [
+            {"type": "regex_text", "value": r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}"},
+        ],
+        "Email": [
+            {"type": "regex_text", "value": r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"},
+        ],
+    },
+
+    # Output columns (order)
+    "OUTPUT_COLUMNS": ["Title", "Address", "Phone", "Email"],
+}
+
+# ========== DO NOT EDIT BELOW (unless you want to tune the template) ==========
+
+@dataclass
+class Row:
+    data: Dict[str, str]
+
+# ---------------- Utilities
+
+def _normalize_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _ensure_absolute(href: str, base: str) -> str:
+    try:
+        return urljoin(base, href)
+    except Exception:
+        return href
+
+def _requests_get(url: str, timeout: int = 30) -> requests.Response:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GenericScraper/1.0; +https://example.com/bot)"
+    }
+    return requests.get(url, headers=headers, timeout=timeout)
+
+# ---------------- Engines
+
+def setup_selenium(headless: bool = True, timeout: int = 45) -> webdriver.Chrome:
+    opts = Options()
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--window-size=1400,900")
+    opts.add_argument("--log-level=3")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    drv = webdriver.Chrome(options=opts)
+    drv.set_page_load_timeout(timeout)
+    return drv
+
+# ---------------- Pagination helpers
+
+def _set_or_remove_page(url: str, param: str, page_num: Optional[int]) -> str:
+    parts = urlparse(url)
+    q = parse_qs(parts.query)
+    if page_num is None:
+        q.pop(param, None)
+    else:
+        q[param] = [str(page_num)]
+    new_query = urlencode(q, doseq=True)
+    return urlunparse((parts.scheme, parts.netloc, parts.path, parts.params, new_query, parts.fragment))
+
+# ---------------- Listing readiness (Selenium)
+
+def wait_for_listing_ready(driver: webdriver.Chrome, selectors: List[str], extra: float = 0.5) -> None:
+    if not selectors:
+        return
+    try:
+        WebDriverWait(driver, 20).until(
+            EC.any_of(*[EC.presence_of_element_located((By.CSS_SELECTOR, sel)) for sel in selectors])
+        )
+        time.sleep(extra)
+    except TimeoutException:
+        # Not fatal; continue
+        pass
+
+# ---------------- Link collection
+
+def collect_links_requests(list_html: str, base_url: str, selectors: List[str]) -> List[str]:
+    soup = BeautifulSoup(list_html, "lxml")
+    links = set()
+    for sel in selectors:
+        for a in soup.select(sel):
+            href = a.get("href")
+            if not href:
+                continue
+            links.add(_ensure_absolute(href, base_url))
+    return sorted(links)
+
+def collect_links_selenium(driver: webdriver.Chrome, base_url: str, selectors: List[str]) -> List[str]:
+    links = set()
+    for sel in selectors:
+        for a in driver.find_elements(By.CSS_SELECTOR, sel):
+            href = a.get_attribute("href")
+            if not href:
+                continue
+            links.add(_ensure_absolute(href, base_url))
+    return sorted(links)
+
+# ---------------- Detail extraction
+
+def extract_field_from_requests(html: str, field_specs: List[Dict[str, Any]]) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(separator=" ", strip=True)
+    for spec in field_specs:
+        t = spec.get("type")
+        v = spec.get("value")
+        if t == "css_text":
+            el = soup.select_one(v)
+            if el and _normalize_space(el.get_text()):
+                return _normalize_space(el.get_text())
+        elif t == "css_attr":
+            sel = soup.select_one(v)
+            attr = spec.get("attr", "href")
+            if sel and sel.has_attr(attr):
+                return _normalize_space(sel[attr])
+        elif t == "regex_text":
+            m = re.search(v, text)
+            if m:
+                return _normalize_space(m.group(0))
+    return ""
+
+def extract_field_from_selenium(driver: webdriver.Chrome, field_specs: List[Dict[str, Any]]) -> str:
+    body_text = ""
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+    except Exception:
+        pass
+
+    for spec in field_specs:
+        t = spec.get("type")
+        v = spec.get("value")
+        if t == "css_text":
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, v)
+                val = _normalize_space(el.text)
+                if val:
+                    return val
+            except NoSuchElementException:
+                continue
+        elif t == "css_attr":
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, v)
+                attr = spec.get("attr", "href")
+                if el.get_attribute(attr):
+                    return _normalize_space(el.get_attribute(attr))
+            except NoSuchElementException:
+                continue
+        elif t == "regex_text":
+            m = re.search(v, body_text or "")
+            if m:
+                return _normalize_space(m.group(0))
+    return ""
+
+# ---------------- Master extraction for a single detail page
+
+def extract_detail_requests(url: str, detail_fields: Dict[str, List[Dict[str, Any]]]) -> Row:
+    r = _requests_get(url)
+    r.raise_for_status()
+    html = r.text
+    data = {}
+    for field, specs in detail_fields.items():
+        data[field] = extract_field_from_requests(html, specs)
+    return Row(data=data)
+
+def extract_detail_selenium(driver: webdriver.Chrome, url: str, detail_fields: Dict[str, List[Dict[str, Any]]],
+                            item_delay: float = 0.3) -> Row:
+    driver.get(url)
+    WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    time.sleep(item_delay)
+    data = {}
+    for field, specs in detail_fields.items():
+        data[field] = extract_field_from_selenium(driver, specs)
+    return Row(data=data)
+
+# ---------------- Main scrape
+
+def scrape(engine: str,
+           headless: bool,
+           pager_mode: str,
+           start_url: str,
+           list_link_selectors: List[str],
+           detail_fields: Dict[str, List[Dict[str, Any]]],
+           listing_ready_selectors: List[str],
+           numeric_page_param: str,
+           numeric_page_start: int,
+           max_pages: int,
+           page_delay: float,
+           item_delay: float,
+           limit: Optional[int]) -> List[Row]:
+    rows: List[Row] = []
+    seen = set()
+
+    if engine == "requests":
+        # STATIC: loop pages via numeric or single page
+        base_for_links = start_url
+        if pager_mode == "numeric":
+            page_idx = numeric_page_start
+            while page_idx < max_pages:
+                list_url = _set_or_remove_page(start_url, numeric_page_param, page_idx if page_idx > 0 else None)
+                print(f"--- Listing page {page_idx} (requests) --- {list_url}")
+                resp = _requests_get(list_url)
+                if resp.status_code != 200:
+                    print(f"[WARN] HTTP {resp.status_code} on {list_url} — stopping.")
+                    break
+                links = collect_links_requests(resp.text, base_for_links, list_link_selectors)
+                print(f"Found {len(links)} links.")
+                if not links:
+                    break
+                for link in links:
+                    if limit and len(rows) >= limit:
+                        break
+                    if link in seen:
+                        continue
+                    seen.add(link)
+                    try:
+                        row = extract_detail_requests(link, detail_fields)
+                        rows.append(row)
+                        time.sleep(item_delay)
+                    except Exception as e:
+                        print(f"[WARN] Error scraping {link}: {e}", file=sys.stderr)
+                if limit and len(rows) >= limit:
+                    break
+                page_idx += 1
+                time.sleep(page_delay)
+        elif pager_mode == "none":
+            print(f"--- Single listing page (requests) --- {start_url}")
+            resp = _requests_get(start_url)
+            resp.raise_for_status()
+            links = collect_links_requests(resp.text, start_url, list_link_selectors)
+            print(f"Found {len(links)} links.")
+            for link in links:
+                if limit and len(rows) >= limit:
+                    break
+                if link in seen:
+                    continue
+                seen.add(link)
+                try:
+                    row = extract_detail_requests(link, detail_fields)
+                    rows.append(row)
+                    time.sleep(item_delay)
+                except Exception as e:
+                    print(f"[WARN] Error scraping {link}: {e}", file=sys.stderr)
+        else:
+            raise ValueError("requests engine supports 'numeric' or 'none' only.")
+        return rows
+
+    elif engine == "selenium":
+        driver = setup_selenium(headless=headless)
+        try:
+            driver.get(start_url)
+            wait_for_listing_ready(driver, listing_ready_selectors, extra=0.6)
+
+            # Numeric pagination (recommended) or clicking "Next"
+            if pager_mode == "numeric":
+                base = _set_or_remove_page(driver.current_url, numeric_page_param, None)
+                page_idx = numeric_page_start
+                while page_idx < max_pages:
+                    list_url = _set_or_remove_page(base, numeric_page_param, None if page_idx == 0 else page_idx)
+                    print(f"--- Listing page {page_idx} (selenium) --- {list_url}")
+                    driver.get(list_url)
+                    wait_for_listing_ready(driver, listing_ready_selectors, extra=0.6)
+                    links = collect_links_selenium(driver, list_url, list_link_selectors)
+                    print(f"Found {len(links)} links.")
+                    if not links:
+                        break
+                    for link in links:
+                        if limit and len(rows) >= limit:
+                            break
+                        if link in seen:
+                            continue
+                        seen.add(link)
+                        try:
+                            row = extract_detail_selenium(driver, link, detail_fields, item_delay=item_delay)
+                            rows.append(row)
+                        except Exception as e:
+                            print(f"[WARN] Error scraping {link}: {e}", file=sys.stderr)
+                    if limit and len(rows) >= limit:
+                        break
+                    page_idx += 1
+                    time.sleep(page_delay)
+
+            elif pager_mode == "none":
+                print(f"--- Single listing page (selenium) --- {start_url}")
+                links = collect_links_selenium(driver, start_url, list_link_selectors)
+                print(f"Found {len(links)} links.")
+                for link in links:
+                    if limit and len(rows) >= limit:
+                        break
+                    if link in seen:
+                        continue
+                    seen.add(link)
+                    try:
+                        row = extract_detail_selenium(driver, link, detail_fields, item_delay=item_delay)
+                        rows.append(row)
+                    except Exception as e:
+                        print(f"[WARN] Error scraping {link}: {e}", file=sys.stderr)
+
+            elif pager_mode == "next":
+                # Implement your site's "Next" button strategy here (selectors depend on site markup)
+                # Example:
+                print("[INFO] 'next' pager mode selected — implement site-specific next-clicking here.")
+                raise NotImplementedError("Implement your site's Next button selectors.")
+
+            else:
+                raise ValueError("pager_mode must be one of: numeric|next|none")
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+        return rows
+
+    else:
+        raise ValueError("engine must be one of: selenium|requests")
+
+# ---------------- Save
+
+def save_to_excel(rows: List[Row], out_path: str, columns: List[str]) -> None:
+    records = []
+    for r in rows:
+        record = {col: r.data.get(col, "") for col in columns}
+        records.append(record)
+    df = pd.DataFrame(records)
+    df.to_excel(out_path, index=False)
+
+# ---------------- CLI
+
+def main():
+    ap = argparse.ArgumentParser(description="General Scrape Tool Template")
+    ap.add_argument("--engine", choices=["selenium", "requests"], default="selenium",
+                    help="Use 'selenium' (dynamic/JS) or 'requests' (static).")
+    ap.add_argument("--headless", action="store_true", help="Headless Chrome (selenium only).")
+    ap.add_argument("--pager", choices=["numeric", "next", "none"], default=CONFIG["PAGER_MODE"],
+                    help="Pagination mode.")
+    ap.add_argument("--out", default="scrape_output.xlsx", help="Output Excel file path")
+    ap.add_argument("--limit", type=int, default=None, help="Limit number of items (for testing)")
+    ap.add_argument("--page-delay", type=float, default=0.8, help="Delay after paging")
+    ap.add_argument("--item-delay", type=float, default=0.4, help="Delay between item pages")
+    args = ap.parse_args()
+
+    print("Starting general scraper...")
+    rows = scrape(
+        engine=args.engine,
+        headless=args.headless,
+        pager_mode=args.pager,
+        start_url=CONFIG["START_URL"],
+        list_link_selectors=CONFIG["LIST_LINK_SELECTORS"],
+        detail_fields=CONFIG["DETAIL_FIELDS"],
+        listing_ready_selectors=CONFIG["LISTING_READY_SELECTORS"],
+        numeric_page_param=CONFIG["NUMERIC_PAGE_PARAM"],
+        numeric_page_start=CONFIG["NUMERIC_PAGE_START"],
+        max_pages=CONFIG["MAX_PAGES"],
+        page_delay=args.page_delay,
+        item_delay=args.item_delay,
+        limit=args.limit,
+    )
+    save_to_excel(rows, args.out, CONFIG["OUTPUT_COLUMNS"])
+    print(f"Done. Wrote {args.out} with {len(rows)} rows.")
+
+if __name__ == "__main__":
+    main()
+
+2) Universal “how to use this template” guide
+A) One-time VS Code setup (Windows)
+
+Install Python 3.12 (recommended):
+
+winget install --id Python.Python.3.12 -e
+
+Verify: py -3.12 --version
+
+Install Google Chrome (for Selenium).
+
+VS Code extensions:
+
+“Python” (Microsoft)
+
+“Pylance”
+
+Open your project folder in VS Code (File → Open Folder).
+
+B) Create & activate a virtual environment
+
+In VS Code Terminal (PowerShell) from your project folder:
+
+python -m venv venv
+
+# Allow activation in this terminal only:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+
+
+You should see (venv) in the prompt.
+(If you close the terminal, re-run the two lines above to re-activate.)
+
+C) Install dependencies
+pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+
+D) Pick your engine
+
+Static pages (HTML renders without JS): use --engine requests
+
+Dynamic pages (content loads via JS): use --engine selenium
+
+You can always test both. If requests returns empty or partial data, switch to selenium.
+
+E) Configure the scraper (what to edit)
+
+Open scraper_template.py and adjust CONFIG:
+
+START_URL: the listing page for the site you’re scraping.
+
+PAGER_MODE: "numeric", "next", or "none".
+
+Prefer "numeric" if the site uses ?page=N or similar. Set NUMERIC_PAGE_PARAM (e.g., "page") and NUMERIC_PAGE_START (often 0).
+
+"next" requires you to add site-specific “Next” selectors inside the elif pager_mode == "next": block.
+
+"none" if all items are on one page.
+
+LISTING_READY_SELECTORS (Selenium only): add CSS selectors that indicate the listing has loaded (e.g., .results, .items, .view-content).
+
+LIST_LINK_SELECTORS: CSS selectors that match detail page links in the listing (e.g., "a.item-link" or "a[href*='/detention-facility/']").
+
+DETAIL_FIELDS: mapping of your output fields to one or more extractor rules.
+
+Use css_text for grabbing text from an element, css_attr for grabbing attribute values, or regex_text to pull patterns from page text.
+
+The extractor list is priority-ordered; the first non-empty match is used.
+
+OUTPUT_COLUMNS: define the output Excel column order.
+
+F) Dry-run a small test
+# Static (requests):
+python scraper_template.py --engine requests --limit 5 --out test.xlsx
+
+# Dynamic (selenium), visible browser:
+python scraper_template.py --engine selenium --limit 5 --out test.xlsx
+
+# Dynamic (selenium), headless:
+python scraper_template.py --engine selenium --headless --limit 5 --out test.xlsx
+
+
+Open test.xlsx and verify the columns/values. Tweak selectors/regex until rows look right.
+
+G) Full run
+# Static
+python scraper_template.py --engine requests --out results.xlsx
+
+# Dynamic (headless)
+python scraper_template.py --engine selenium --headless --out results.xlsx
+
+H) Common adaptations (where to plug in details)
+
+Different pagination parameter: set NUMERIC_PAGE_PARAM (e.g., "p", "offset" if it’s index-based; you can extend numeric logic to compute offsets).
+
+Next button pager: switch --pager next and implement site-specific “Next” clicks in the elif pager_mode == "next": block (use Selenium and the pager’s CSS/XPath).
+
+Multiple detail pages per item: add another extractor that follows a secondary link from the detail page before extracting fields.
+
+Emails/Phones embedded: add regex_text patterns to DETAIL_FIELDS (you can also add a “lax” email regex if sites insert spaces).
+
+Rate limits: increase --item-delay and --page-delay.
+
+3) Quick checklist before each new project
+
+ Identify if the site is static or dynamic.
+
+ Confirm legal & terms: scraping allowed? (Check robots.txt/ToS; avoid personal data).
+
+ Decide pagination mode (numeric is the most robust).
+
+ Find listing link selectors (right-click → Inspect → copy CSS selector).
+
+ List the fields you need, then map each to CSS or regex rules in DETAIL_FIELDS.
+
+ Create the venv & install requirements.
+
+ Run with --limit 5 and verify the Excel output.
+
+ Scale to the full run.
+
+ Save your tuned CONFIG as a new file (e.g., scraper_mySite.py) for reuse.
+
+4) Troubleshooting (the greatest hits)
+
+PowerShell won’t activate venv
+Use session-only bypass:
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+
+
+requests sees no data but browser shows content
+The site is dynamic → use --engine selenium.
+
+Selenium isn’t finding elements
+Add/adjust LISTING_READY_SELECTORS; increase waits; verify selectors in DevTools.
+
+Pagination stops after page 0
+Confirm PAGER_MODE="numeric" and NUMERIC_PAGE_PARAM is correct; open page 2 manually in your browser to see the param (e.g., ?page=1, ?p=2, ?offset=50).
+
+Excel has blank columns
+Your DETAIL_FIELDS selectors or regex don’t match. Inspect the detail page and refine. Remember you can chain multiple extractors per field.
+
+Chrome updates broke Selenium
+Usually fixed by updating Chrome to latest stable; Selenium 4.21+ uses built-in driver management.
